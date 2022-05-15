@@ -20,6 +20,8 @@ panic-halt = "0.2.0"
 smart-leds = "0.3.0"
 nb = "1.0.0"
 ws2812-pio = { git = "https://github.com/ithinuel/ws2812-pio-rs", rev = "fd6b6604d65a66242b52ccf7f24a95ca325991dd" }
+usb-device = "0.2.8"
+usbd-hid = "0.6.0"
 
 # I'm using the Adafruit KB2040
 adafruit-kb2040 = "0.2.0"
