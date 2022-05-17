@@ -9,6 +9,7 @@ resolver = "2"
 [dependencies]
 cortex-m = "0.7.3"
 cortex-m-rt = "0.7.0"
+cortex-m-rtic = "1.1.2"
 embedded-hal = { version = "0.2.5", features = ["unproven"] }
 embedded-time = "0.12.0"
 
@@ -22,6 +23,7 @@ nb = "1.0.0"
 ws2812-pio = { git = "https://github.com/ithinuel/ws2812-pio-rs", rev = "fd6b6604d65a66242b52ccf7f24a95ca325991dd" }
 usb-device = "0.2.8"
 usbd-hid = "0.6.0"
+usbd-serial = "0.1.1"
 
 # I'm using the Adafruit KB2040
 adafruit-kb2040 = "0.2.0"

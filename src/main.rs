@@ -10,160 +10,130 @@
 
 mod keymatrix;
 
-use keymatrix::*;
-
-use adafruit_kb2040::{
-    hal::{
-        clocks::{init_clocks_and_plls, Clock},
-        gpio::{AnyPin, DynPin, FunctionConfig, ValidPinMode},
-        pac::{self, interrupt},
-        pio::{PIOExt, StateMachineIndex, SM0},
-        timer::Timer,
-        usb,
-        watchdog::Watchdog,
-        Sio,
-    },
-    pac::PIO0,
-    XOSC_CRYSTAL_FREQ,
-};
-use core::iter::once;
-use cortex_m_rt::entry;
-use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::{
-    digital::v2::{InputPin, OutputPin},
-    timer::CountDown,
-};
-use embedded_time::duration::{Extensions, Microseconds};
-use nb::block;
 use panic_halt as _;
-use smart_leds::{
-    brightness,
-    colors::{BLACK, INDIGO},
-    SmartLedsWrite, RGB8,
-};
-use usb_device::{class_prelude::*, prelude::*};
-use usbd_hid::descriptor::generator_prelude::*;
-use usbd_hid::descriptor::KeyboardReport;
-use usbd_hid::hid_class::HIDClass;
+use rtic::app;
 
-use ws2812_pio::Ws2812;
+#[app(device = adafruit_kb2040::hal::pac, peripherals = true)]
+mod app {
 
-static mut USB_DEVICE: Option<UsbDevice<usb::UsbBus>> = None;
-static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBus>> = None;
-static mut USB_HID: Option<HIDClass<usb::UsbBus>> = None;
-/// Entry point to our bare-metal application.
-///
-/// The `#[entry]` macro ensures the Cortex-M start-up code calls this
-/// function as soon as all global variables are initialised.
-///
-/// The function configures the RP2040 peripherals, then the LED, then runs
-/// the colour wheel in an infinite loop.
-#[entry]
-fn main() -> ! {
-    // Configure the RP2040 peripherals
-    info!("Program Start");
-    let mut pac = pac::Peripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+    use crate::keymatrix::*;
 
-    let clocks = init_clocks_and_plls(
-        XOSC_CRYSTAL_FREQ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .ok()
-    .unwrap();
+    use adafruit_kb2040::{
+        hal::{self, resets, watchdog},
+        pac, XOSC_CRYSTAL_FREQ,
+    };
+    use usb_device::{class_prelude::*, prelude::*};
+    use usbd_hid::{
+        descriptor::{generator_prelude::*, KeyboardReport},
+        hid_class::HIDClass,
+    };
+    use usbd_serial::SerialPort;
 
-    let usb_bus = UsbBusAllocator::new(usb::UsbBus::new(
-        pac.USBCTRL_REGS,
-        pac.USBCTRL_DPRAM,
-        clocks.usb_clock,
-        true,
-        &mut pac.RESETS,
-    ));
-
-    unsafe {
-        USB_BUS = Some(usb_bus);
+    #[shared]
+    struct Shared {
+        usb_serial: SerialPort<'static, hal::usb::UsbBus>,
+        usb_hid: usbd_hid::hid_class::HIDClass<'static, hal::usb::UsbBus>,
+        usb_dev: usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
     }
 
-    let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
+    #[local]
+    struct Local {}
 
-    let usb_hid = HIDClass::new(bus_ref, KeyboardReport::desc(), 60);
+    #[init(local = [usb_bus: Option<usb_device::bus::UsbBusAllocator<hal::usb::UsbBus>> = None])]
+    fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
+        //
+        // initialise clocks
+        //
 
-    unsafe {
-        USB_HID = Some(usb_hid);
+        let mut resets = c.device.RESETS;
+        let mut watchdog = hal::watchdog::Watchdog::new(c.device.WATCHDOG);
+
+        // configure clock - default 125 MHz
+        let clocks = hal::clocks::init_clocks_and_plls(
+            XOSC_CRYSTAL_FREQ,
+            c.device.XOSC,
+            c.device.CLOCKS,
+            c.device.PLL_SYS,
+            c.device.PLL_USB,
+            &mut resets,
+            &mut watchdog,
+        )
+        .ok()
+        .unwrap();
+
+        // setup USB
+
+        let usb_bus = c
+            .local
+            .usb_bus
+            .insert(UsbBusAllocator::new(hal::usb::UsbBus::new(
+                c.device.USBCTRL_REGS,
+                c.device.USBCTRL_DPRAM,
+                clocks.usb_clock,
+                true,
+                &mut resets,
+            )));
+
+        let usb_serial = SerialPort::new(usb_bus);
+
+        let usb_hid = HIDClass::new(usb_bus, KeyboardReport::desc(), 10);
+
+        let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid((0x16c0), (0x27dd)))
+            .manufacturer("ifacodes")
+            .product("keebifa Keyboard")
+            .serial_number("ifapersonal")
+            .device_class(0x02)
+            .build();
+
+        (
+            Shared {
+                usb_serial,
+                usb_hid,
+                usb_dev,
+            },
+            Local {},
+            init::Monotonics(),
+        )
     }
 
-    let usb_dev = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27db))
-        .manufacturer("ifacodes")
-        .product("keebifa")
-        .serial_number("1010")
-        .device_class(0xEF)
-        .build();
+    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_serial, usb_hid, usb_dev])]
+    fn usb_rx(cx: usb_rx::Context) {
+        let usb_serial = cx.shared.usb_serial;
+        let usb_hid = cx.shared.usb_hid;
+        let usb_dev = cx.shared.usb_dev;
 
-    unsafe {
-        USB_DEVICE = Some(usb_dev);
+        (usb_serial, usb_hid, usb_dev).lock(|usb_serial, usb_hid, usb_dev| {
+            //if usb_dev.poll(&mut [usb_hid]) {}
+
+            if usb_dev.poll(&mut [usb_serial]) {
+                let mut buf = [0u8; 64];
+                match usb_serial.read(&mut buf) {
+                    Err(_e) => {
+                        // Do nothing
+                        // let _ = serial_a.write(b"Error.");
+                        // let _ = serial_a.flush();
+                    }
+                    Ok(0) => {
+                        // Do nothing
+                        let _ = usb_serial.write(b"Didn't received data.");
+                        let _ = usb_serial.flush();
+                    }
+                    Ok(count) => {
+                        buf.iter_mut().take(count).for_each(|b| {
+                            b.make_ascii_uppercase();
+                        });
+
+                        // Send back to the host
+                        let mut wr_ptr = &buf[..count];
+                        while !wr_ptr.is_empty() {
+                            let _ = usb_serial.write(wr_ptr).map(|len| {
+                                wr_ptr = &wr_ptr[len..];
+                            });
+                        }
+                    }
+                }
+            }
+        });
     }
-
-    unsafe {
-        pac::NVIC::unmask(pac::interrupt::USBCTRL_IRQ);
-    }
-
-    let sio = Sio::new(pac.SIO);
-
-    let pins = adafruit_kb2040::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    // let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-    // let mut delay = timer.count_down();
-
-    let mut mat: Matrix<DynPin, DynPin, 13, 5> = Matrix::new(
-        [
-            pins.tx.into(),
-            pins.rx.into(),
-            pins.d2.into(),
-            pins.d3.into(),
-            pins.d4.into(),
-            pins.d5.into(),
-            pins.d6.into(),
-            pins.d7.into(),
-            pins.d8.into(),
-            pins.d9.into(),
-            pins.d10.into(),
-            pins.d11.into(),
-            pins.mosi.into(),
-        ],
-        [
-            pins.a0.into(),
-            pins.a1.into(),
-            pins.a2.into(),
-            pins.a3.into(),
-            pins.miso.into(),
-        ],
-    )
-    .unwrap();
-
-    loop {
-        // let _ = mat.poll(&mut ws).unwrap();
-        //let _ = serial.write(b"Hello World!\r\n");
-        // delay.start(23.milliseconds());
-        // let _ = nb::block!(delay.wait()).unwrap();
-    }
-}
-
-#[allow(non_snake_case)]
-#[interrupt]
-unsafe fn USBCTRL_IRQ() {
-    // Handle USB request
-    let usb_dev = USB_DEVICE.as_mut().unwrap();
-    let usb_hid = USB_HID.as_mut().unwrap();
-    usb_dev.poll(&mut [usb_hid]);
 }
