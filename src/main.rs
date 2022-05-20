@@ -8,8 +8,7 @@
 #![no_std]
 #![no_main]
 
-mod keymatrix;
-
+mod layout;
 use defmt_rtt as _;
 use panic_halt as _;
 use rtic::app;
@@ -17,28 +16,44 @@ use rtic::app;
 #[app(device = adafruit_kb2040::hal::pac, peripherals = true)]
 mod app {
 
-    use crate::keymatrix::*;
+    use crate::layout::*;
 
     use adafruit_kb2040::{
-        hal::{self, resets, watchdog},
-        pac, XOSC_CRYSTAL_FREQ,
+        hal::{self, gpio::DynPin, Timer},
+        XOSC_CRYSTAL_FREQ,
     };
+    use cortex_m::prelude::{
+        _embedded_hal_watchdog_Watchdog, _embedded_hal_watchdog_WatchdogEnable,
+    };
+    use embedded_time::duration::Extensions;
+    use keyberon::key_code::KbHidReport;
     use usb_device::{class_prelude::*, prelude::*};
-    use usbd_hid::{
-        descriptor::{generator_prelude::*, KeyboardReport},
-        hid_class::HIDClass,
+
+    use keyberon::{
+        debounce::Debouncer,
+        key_code::KeyCode,
+        layout::{Event, Layout},
+        matrix::Matrix,
     };
-    use usbd_serial::SerialPort;
+
+    const COL_NUM: usize = 2;
+    const ROW_NUM: usize = 2;
 
     #[shared]
     struct Shared {
-        usb_serial: SerialPort<'static, hal::usb::UsbBus>,
-        usb_hid: usbd_hid::hid_class::HIDClass<'static, hal::usb::UsbBus>,
+        usb_hid:
+            keyberon::hid::HidClass<'static, hal::usb::UsbBus, keyberon::keyboard::Keyboard<()>>,
         usb_dev: usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
+        timer: hal::timer::Timer,
+        alarm: hal::timer::Alarm0,
     }
 
     #[local]
-    struct Local {}
+    struct Local {
+        matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM>,
+        debouncer: Debouncer<[[bool; COL_NUM]; ROW_NUM]>,
+        layout: Layout<COL_NUM, ROW_NUM, 1>,
+    }
 
     #[init(local = [usb_bus: Option<usb_device::bus::UsbBusAllocator<hal::usb::UsbBus>> = None])]
     fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
@@ -75,65 +90,119 @@ mod app {
                 &mut resets,
             )));
 
-        let usb_serial = SerialPort::new(usb_bus);
+        let usb_hid = keyberon::new_class(usb_bus, ());
 
-        let usb_hid = HIDClass::new(usb_bus, KeyboardReport::desc(), 10);
-
-        let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid((0x16c0), (0x27dd)))
+        let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
             .manufacturer("ifacodes")
             .product("keebifa Keyboard")
             .serial_number("ifapersonal")
-            .device_class(0x02)
+            .device_class(0x03)
             .build();
+
+        //*******
+        // Initalize pins and keyboard matrix.
+        let sio = hal::Sio::new(c.device.SIO);
+
+        let pins = adafruit_kb2040::Pins::new(
+            c.device.IO_BANK0,
+            c.device.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut resets,
+        );
+
+        let matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM> =
+            cortex_m::interrupt::free(move |_cs| {
+                Matrix::new(
+                    [
+                        pins.d2.into_pull_up_input().into(),
+                        pins.d3.into_pull_up_input().into(),
+                    ],
+                    [
+                        pins.a2.into_push_pull_output().into(),
+                        pins.a1.into_push_pull_output().into(),
+                    ],
+                )
+            })
+            .unwrap();
+
+        let debouncer =
+            Debouncer::new([[false; COL_NUM]; ROW_NUM], [[false; COL_NUM]; ROW_NUM], 30);
+
+        let layout = Layout::new(&TEST_LAYER);
+
+        let mut timer = Timer::new(c.device.TIMER, &mut resets);
+        let mut alarm = timer.alarm_0().unwrap();
+        let _ = alarm.schedule(1000.microseconds());
+        alarm.enable_interrupt();
 
         (
             Shared {
-                usb_serial,
                 usb_hid,
                 usb_dev,
+                timer,
+                alarm,
             },
-            Local {},
+            Local {
+                matrix,
+                debouncer,
+                layout,
+            },
             init::Monotonics(),
         )
     }
 
-    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_serial, usb_hid, usb_dev])]
+    #[idle]
+    fn idle(_: idle::Context) -> ! {
+        loop {
+            rtic::export::nop();
+        }
+    }
+    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm], local = [matrix, debouncer, layout])]
+    fn timer_irq(mut cx: timer_irq::Context) {
+        // Clear Interrupt
+        let mut alarm = cx.shared.alarm;
+        alarm.lock(|a| {
+            a.clear_interrupt();
+            let _ = a.schedule(10_000.microseconds());
+        });
+
+        for event in cx.local.debouncer.events(cx.local.matrix.get().unwrap()) {
+            cx.local.layout.event(event);
+        }
+        cx.local.layout.tick();
+        send_report(cx.local.layout.keycodes(), &mut cx.shared.usb_hid);
+    }
+
+    fn send_report(
+        iter: impl Iterator<Item = KeyCode>,
+        usb_hid: &mut shared_resources::usb_hid_that_needs_to_be_locked,
+    ) {
+        use rtic::Mutex;
+        let report: KbHidReport = iter.collect();
+        if usb_hid.lock(|h| h.device_mut().set_keyboard_report(report.clone())) {
+            while let Ok(0) = usb_hid.lock(|u| u.write(report.as_bytes())) {}
+        }
+    }
+
+    // #[task(priority = 2, capacity = 8)]
+    // fn report(mut cx: report::Context) {
+    //     let report = cx.local.report;
+    //     let key_table = cx.local.key_table;
+    //     let result = cx.local.matrix.poll().unwrap();
+    //     for (y, row) in result.iter().enumerate() {
+    //         for (x, _) in row.iter().enumerate() {
+    //             update_report(report, key_table[y][x], result[y][x])
+    //         }
+    //     }
+    //     cx.shared.usb_hid.lock(|s| s.push_input(report).unwrap());
+    // }
+
+    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_hid, usb_dev])]
     fn usb_rx(cx: usb_rx::Context) {
-        let usb_serial = cx.shared.usb_serial;
+        //let usb_serial = cx.shared.usb_serial;
         let usb_hid = cx.shared.usb_hid;
         let usb_dev = cx.shared.usb_dev;
 
-        (usb_serial, usb_hid, usb_dev).lock(|usb_serial, usb_hid, usb_dev| {
-            //if usb_dev.poll(&mut [usb_hid]) {}
-
-            if usb_dev.poll(&mut [usb_serial]) {
-                let mut buf = [0u8; 64];
-                match usb_serial.read(&mut buf) {
-                    Err(_e) => {
-                        // Do nothing
-                        // let _ = serial_a.write(b"Error.");
-                        // let _ = serial_a.flush();
-                    }
-                    Ok(0) => {
-                        // Do nothing
-                        let _ = usb_serial.write(b"Didn't received data.");
-                        let _ = usb_serial.flush();
-                    }
-                    Ok(count) => {
-                        buf.iter_mut().take(count).for_each(|b| {
-                            b.make_ascii_uppercase();
-                        });
-
-                        // Send back to the host
-                        let mut wr_ptr = &buf[..count];
-                        while !wr_ptr.is_empty() {
-                            let _ = usb_serial.write(wr_ptr).map(|len| {
-                                wr_ptr = &wr_ptr[len..];
-                            });
-                        }
-                    }
-                }
-            }
-        });
+        (usb_hid, usb_dev).lock(|usb_hid, usb_dev| usb_dev.poll(&mut [usb_hid]));
     }
 }
