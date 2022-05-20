@@ -13,7 +13,7 @@ use defmt_rtt as _;
 use panic_halt as _;
 use rtic::app;
 
-#[app(device = adafruit_kb2040::hal::pac, peripherals = true)]
+#[app(device = adafruit_kb2040::hal::pac, peripherals = true, dispatchers = [PIO0_IRQ_0])]
 mod app {
 
     use crate::layout::*;
@@ -26,12 +26,11 @@ mod app {
         _embedded_hal_watchdog_Watchdog, _embedded_hal_watchdog_WatchdogEnable,
     };
     use embedded_time::duration::Extensions;
-    use keyberon::key_code::KbHidReport;
     use usb_device::{class_prelude::*, prelude::*};
 
     use keyberon::{
         debounce::Debouncer,
-        key_code::KeyCode,
+        key_code::{KbHidReport, KeyCode},
         layout::{Event, Layout},
         matrix::Matrix,
     };
@@ -46,14 +45,18 @@ mod app {
         usb_dev: usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
         timer: hal::timer::Timer,
         alarm: hal::timer::Alarm0,
+        #[lock_free]
+        matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM>,
+        #[lock_free]
+        debouncer: Debouncer<[[bool; COL_NUM]; ROW_NUM]>,
+        #[lock_free]
+        layout: Layout<COL_NUM, ROW_NUM, 1>,
+        #[lock_free]
+        watchdog: hal::watchdog::Watchdog,
     }
 
     #[local]
-    struct Local {
-        matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM>,
-        debouncer: Debouncer<[[bool; COL_NUM]; ROW_NUM]>,
-        layout: Layout<COL_NUM, ROW_NUM, 1>,
-    }
+    struct Local {}
 
     #[init(local = [usb_bus: Option<usb_device::bus::UsbBusAllocator<hal::usb::UsbBus>> = None])]
     fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
@@ -114,8 +117,8 @@ mod app {
             cortex_m::interrupt::free(move |_cs| {
                 Matrix::new(
                     [
-                        pins.d2.into_pull_up_input().into(),
-                        pins.d3.into_pull_up_input().into(),
+                        pins.d2.into_pull_down_input().into(),
+                        pins.d3.into_pull_down_input().into(),
                     ],
                     [
                         pins.a2.into_push_pull_output().into(),
@@ -134,6 +137,7 @@ mod app {
         let mut alarm = timer.alarm_0().unwrap();
         let _ = alarm.schedule(1000.microseconds());
         alarm.enable_interrupt();
+        watchdog.start(10000.microseconds());
 
         (
             Shared {
@@ -141,49 +145,48 @@ mod app {
                 usb_dev,
                 timer,
                 alarm,
-            },
-            Local {
                 matrix,
                 debouncer,
                 layout,
+                watchdog,
             },
+            Local {},
             init::Monotonics(),
         )
     }
 
-    #[idle]
-    fn idle(_: idle::Context) -> ! {
-        loop {
-            rtic::export::nop();
-        }
-    }
-    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm], local = [matrix, debouncer, layout])]
+    // #[idle]
+    // fn idle(_: idle::Context) -> ! {
+    //     loop {
+    //         rtic::export::nop();
+    //     }
+    // }
+    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm, matrix, debouncer, layout, watchdog])]
     fn timer_irq(mut cx: timer_irq::Context) {
         // Clear Interrupt
         let mut alarm = cx.shared.alarm;
         alarm.lock(|a| {
             a.clear_interrupt();
-            let _ = a.schedule(10_000.microseconds());
+            let _ = a.schedule(1000.microseconds());
         });
 
-        for event in cx.local.debouncer.events(cx.local.matrix.get().unwrap()) {
-            cx.local.layout.event(event);
-        }
-        cx.local.layout.tick();
-        send_report(cx.local.layout.keycodes(), &mut cx.shared.usb_hid);
-    }
+        cx.shared.watchdog.feed();
 
-    fn send_report(
-        iter: impl Iterator<Item = KeyCode>,
-        usb_hid: &mut shared_resources::usb_hid_that_needs_to_be_locked,
-    ) {
-        use rtic::Mutex;
-        let report: KbHidReport = iter.collect();
-        if usb_hid.lock(|h| h.device_mut().set_keyboard_report(report.clone())) {
-            while let Ok(0) = usb_hid.lock(|u| u.write(report.as_bytes())) {}
+        for event in cx.shared.debouncer.events(cx.shared.matrix.get().unwrap()) {
+            cx.shared.layout.event(event);
         }
-    }
+        cx.shared.layout.tick();
 
+        let report: KbHidReport = cx.shared.layout.keycodes().collect();
+        if !cx
+            .shared
+            .usb_hid
+            .lock(|h| h.device_mut().set_keyboard_report(report.clone()))
+        {
+            return;
+        }
+        while let Ok(0) = cx.shared.usb_hid.lock(|h| h.write(report.as_bytes())) {}
+    }
     // #[task(priority = 2, capacity = 8)]
     // fn report(mut cx: report::Context) {
     //     let report = cx.local.report;
@@ -203,6 +206,10 @@ mod app {
         let usb_hid = cx.shared.usb_hid;
         let usb_dev = cx.shared.usb_dev;
 
-        (usb_hid, usb_dev).lock(|usb_hid, usb_dev| usb_dev.poll(&mut [usb_hid]));
+        (usb_hid, usb_dev).lock(|h, d| {
+            if d.poll(&mut [h]) {
+                h.poll();
+            }
+        });
     }
 }
