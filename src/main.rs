@@ -1,9 +1,7 @@
-//! # Rainbow Example for the Adafruit KB2040
+//! # keebifa Keyboard Firmware for Adafruit KB2040
 //!
-//! Runs a rainbow-effect colour wheel on the on-board LED.
+//! Keyboard firmware for a Alice layout keyboard written using Keyberon
 //!
-//! Uses the `ws2812_pio` driver to control the LED, which in turns uses the
-//! RP2040's PIO block.
 
 #![no_std]
 #![no_main]
@@ -19,30 +17,16 @@ mod app {
     use crate::layout::*;
 
     use adafruit_kb2040::{
-        hal::{
-            self,
-            clocks::Clock,
-            gpio::{bank0::Gpio17, DynPin},
-            pio::{PIOExt, SM0},
-            Timer,
-        },
-        pac::PIO0,
+        hal::{self, gpio::DynPin, Timer},
         XOSC_CRYSTAL_FREQ,
     };
     use cortex_m::prelude::{
         _embedded_hal_watchdog_Watchdog, _embedded_hal_watchdog_WatchdogEnable,
     };
     use embedded_time::duration::Extensions;
-    use smart_leds::{brightness, colors::*, SmartLedsWrite};
     use usb_device::{class_prelude::*, prelude::*};
-    use ws2812_pio::Ws2812Direct;
 
-    use keyberon::{
-        debounce::Debouncer,
-        key_code::{KbHidReport, KeyCode},
-        layout::{Event, Layout},
-        matrix::Matrix,
-    };
+    use keyberon::{debounce::Debouncer, key_code::KbHidReport, layout::Layout, matrix::Matrix};
 
     const COL_NUM: usize = 2;
     const ROW_NUM: usize = 2;
@@ -54,7 +38,6 @@ mod app {
         usb_dev: usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
         timer: hal::timer::Timer,
         alarm: hal::timer::Alarm0,
-        ws: Ws2812Direct<PIO0, SM0, Gpio17>,
         #[lock_free]
         matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM>,
         #[lock_free]
@@ -66,15 +49,12 @@ mod app {
     }
 
     #[local]
-    struct Local {
-        led: u8,
-    }
+    struct Local {}
 
     #[init(local = [usb_bus: Option<usb_device::bus::UsbBusAllocator<hal::usb::UsbBus>> = None])]
     fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
         //
         // initialise clocks
-        //
 
         let mut resets = c.device.RESETS;
         let mut watchdog = hal::watchdog::Watchdog::new(c.device.WATCHDOG);
@@ -112,11 +92,11 @@ mod app {
             .manufacturer("ifacodes")
             .product("keebifa Keyboard")
             .serial_number("ifapersonal")
-            .device_class(0x03)
+            .device_class(0x02)
             .build();
 
-        //*******
         // Initalize pins and keyboard matrix.
+
         let sio = hal::Sio::new(c.device.SIO);
 
         let pins = adafruit_kb2040::Pins::new(
@@ -126,16 +106,7 @@ mod app {
             &mut resets,
         );
 
-        let (mut pio, sm0, _, _, _) = c.device.PIO0.split(&mut resets);
-
-        let mut ws = Ws2812Direct::new(
-            pins.neopixel.into_mode(),
-            &mut pio,
-            sm0,
-            clocks.peripheral_clock.freq(),
-        );
-
-        //ws.write([GREEN].iter().copied()).unwrap();
+        // initialize keyboard related structs
 
         let matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM> =
             cortex_m::interrupt::free(move |_cs| {
@@ -157,6 +128,8 @@ mod app {
 
         let layout = Layout::new(&TEST_LAYER);
 
+        // initalisze timer, alarm, and watchdog
+
         let mut timer = Timer::new(c.device.TIMER, &mut resets);
         let mut alarm = timer.alarm_0().unwrap();
         let _ = alarm.schedule(1000.microseconds());
@@ -174,26 +147,13 @@ mod app {
                 debouncer,
                 layout,
                 watchdog,
-                ws,
             },
-            Local { led: 0 },
+            Local {},
             init::Monotonics(),
         )
     }
 
-    // #[idle(shared = [usb_hid, usb_dev, ws])]
-    // fn idle(mut cx: idle::Context) -> ! {
-    //     let usb_hid = cx.shared.usb_hid;
-    //     let usb_dev = cx.shared.usb_dev;
-    //     let ws = cx.shared.ws;
-    //     (usb_hid, usb_dev, ws).lock(|h, d, w| loop {
-    //         w.write([BLUE].iter().copied()).unwrap();
-    //         if d.poll(&mut [h]) {
-    //             h.poll();
-    //         }
-    //     })
-    // }
-    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm, matrix, debouncer, layout, watchdog, ws], local = [led])]
+    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm, matrix, debouncer, layout, watchdog])]
     fn timer_irq(mut cx: timer_irq::Context) {
         // Clear Interrupt
         let mut alarm = cx.shared.alarm;
@@ -204,47 +164,27 @@ mod app {
 
         cx.shared.watchdog.feed();
 
-        (cx.shared.ws).lock(|w| {
-            w.write(brightness([GREEN].iter().copied(), 32)).unwrap();
-        });
-
         for event in cx.shared.debouncer.events(cx.shared.matrix.get().unwrap()) {
             cx.shared.layout.event(event);
         }
         cx.shared.layout.tick();
 
         let report: KbHidReport = cx.shared.layout.keycodes().collect();
-        if !cx
+        if cx
             .shared
             .usb_hid
             .lock(|h| h.device_mut().set_keyboard_report(report.clone()))
         {
-            return;
+            while let Ok(0) = cx.shared.usb_hid.lock(|h| h.write(report.as_bytes())) {}
         }
-        while let Ok(0) = cx.shared.usb_hid.lock(|h| h.write(report.as_bytes())) {}
     }
-    // #[task(priority = 2, capacity = 8)]
-    // fn report(mut cx: report::Context) {
-    //     let report = cx.local.report;
-    //     let key_table = cx.local.key_table;
-    //     let result = cx.local.matrix.poll().unwrap();
-    //     for (y, row) in result.iter().enumerate() {
-    //         for (x, _) in row.iter().enumerate() {
-    //             update_report(report, key_table[y][x], result[y][x])
-    //         }
-    //     }
-    //     cx.shared.usb_hid.lock(|s| s.push_input(report).unwrap());
-    // }
 
-    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_hid, usb_dev, ws])]
+    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_hid, usb_dev])]
     fn usb_rx(cx: usb_rx::Context) {
-        //let usb_serial = cx.shared.usb_serial;
         let usb_hid = cx.shared.usb_hid;
         let usb_dev = cx.shared.usb_dev;
-        let ws = cx.shared.ws;
 
-        (usb_hid, usb_dev, ws).lock(|h, d, w| {
-            w.write(brightness([RED].iter().copied(), 32)).unwrap();
+        (usb_hid, usb_dev).lock(|h, d| {
             if d.poll(&mut [h]) {
                 h.poll();
             }
