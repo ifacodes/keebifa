@@ -19,14 +19,23 @@ mod app {
     use crate::layout::*;
 
     use adafruit_kb2040::{
-        hal::{self, gpio::DynPin, Timer},
+        hal::{
+            self,
+            clocks::Clock,
+            gpio::{bank0::Gpio17, DynPin},
+            pio::{PIOExt, SM0},
+            Timer,
+        },
+        pac::PIO0,
         XOSC_CRYSTAL_FREQ,
     };
     use cortex_m::prelude::{
         _embedded_hal_watchdog_Watchdog, _embedded_hal_watchdog_WatchdogEnable,
     };
     use embedded_time::duration::Extensions;
+    use smart_leds::{brightness, colors::*, SmartLedsWrite};
     use usb_device::{class_prelude::*, prelude::*};
+    use ws2812_pio::Ws2812Direct;
 
     use keyberon::{
         debounce::Debouncer,
@@ -45,6 +54,7 @@ mod app {
         usb_dev: usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
         timer: hal::timer::Timer,
         alarm: hal::timer::Alarm0,
+        ws: Ws2812Direct<PIO0, SM0, Gpio17>,
         #[lock_free]
         matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM>,
         #[lock_free]
@@ -56,7 +66,9 @@ mod app {
     }
 
     #[local]
-    struct Local {}
+    struct Local {
+        led: u8,
+    }
 
     #[init(local = [usb_bus: Option<usb_device::bus::UsbBusAllocator<hal::usb::UsbBus>> = None])]
     fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
@@ -66,6 +78,7 @@ mod app {
 
         let mut resets = c.device.RESETS;
         let mut watchdog = hal::watchdog::Watchdog::new(c.device.WATCHDOG);
+        watchdog.pause_on_debug(false);
 
         // configure clock - default 125 MHz
         let clocks = hal::clocks::init_clocks_and_plls(
@@ -113,12 +126,23 @@ mod app {
             &mut resets,
         );
 
+        let (mut pio, sm0, _, _, _) = c.device.PIO0.split(&mut resets);
+
+        let mut ws = Ws2812Direct::new(
+            pins.neopixel.into_mode(),
+            &mut pio,
+            sm0,
+            clocks.peripheral_clock.freq(),
+        );
+
+        //ws.write([GREEN].iter().copied()).unwrap();
+
         let matrix: Matrix<DynPin, DynPin, COL_NUM, ROW_NUM> =
             cortex_m::interrupt::free(move |_cs| {
                 Matrix::new(
                     [
-                        pins.d2.into_pull_down_input().into(),
-                        pins.d3.into_pull_down_input().into(),
+                        pins.d2.into_pull_up_input().into(),
+                        pins.d3.into_pull_up_input().into(),
                     ],
                     [
                         pins.a2.into_push_pull_output().into(),
@@ -137,7 +161,8 @@ mod app {
         let mut alarm = timer.alarm_0().unwrap();
         let _ = alarm.schedule(1000.microseconds());
         alarm.enable_interrupt();
-        watchdog.start(10000.microseconds());
+
+        watchdog.start(10_000.microseconds());
 
         (
             Shared {
@@ -149,19 +174,26 @@ mod app {
                 debouncer,
                 layout,
                 watchdog,
+                ws,
             },
-            Local {},
+            Local { led: 0 },
             init::Monotonics(),
         )
     }
 
-    // #[idle]
-    // fn idle(_: idle::Context) -> ! {
-    //     loop {
-    //         rtic::export::nop();
-    //     }
+    // #[idle(shared = [usb_hid, usb_dev, ws])]
+    // fn idle(mut cx: idle::Context) -> ! {
+    //     let usb_hid = cx.shared.usb_hid;
+    //     let usb_dev = cx.shared.usb_dev;
+    //     let ws = cx.shared.ws;
+    //     (usb_hid, usb_dev, ws).lock(|h, d, w| loop {
+    //         w.write([BLUE].iter().copied()).unwrap();
+    //         if d.poll(&mut [h]) {
+    //             h.poll();
+    //         }
+    //     })
     // }
-    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm, matrix, debouncer, layout, watchdog])]
+    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [usb_hid, timer, alarm, matrix, debouncer, layout, watchdog, ws], local = [led])]
     fn timer_irq(mut cx: timer_irq::Context) {
         // Clear Interrupt
         let mut alarm = cx.shared.alarm;
@@ -171,6 +203,10 @@ mod app {
         });
 
         cx.shared.watchdog.feed();
+
+        (cx.shared.ws).lock(|w| {
+            w.write(brightness([GREEN].iter().copied(), 32)).unwrap();
+        });
 
         for event in cx.shared.debouncer.events(cx.shared.matrix.get().unwrap()) {
             cx.shared.layout.event(event);
@@ -200,13 +236,15 @@ mod app {
     //     cx.shared.usb_hid.lock(|s| s.push_input(report).unwrap());
     // }
 
-    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_hid, usb_dev])]
+    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [usb_hid, usb_dev, ws])]
     fn usb_rx(cx: usb_rx::Context) {
         //let usb_serial = cx.shared.usb_serial;
         let usb_hid = cx.shared.usb_hid;
         let usb_dev = cx.shared.usb_dev;
+        let ws = cx.shared.ws;
 
-        (usb_hid, usb_dev).lock(|h, d| {
+        (usb_hid, usb_dev, ws).lock(|h, d, w| {
+            w.write(brightness([RED].iter().copied(), 32)).unwrap();
             if d.poll(&mut [h]) {
                 h.poll();
             }
