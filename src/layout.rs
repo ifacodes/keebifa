@@ -1,5 +1,5 @@
 use keebifa_macros::alice_layout;
-use keyberon::action::Action::{self, *};
+use keyberon::action::Action::{self};
 use keyberon::layout::*;
 
 const fn arrange_layer(input: [Action; 65]) -> [[Action; 13]; 5] {
@@ -27,14 +27,12 @@ const fn arrange_layer(input: [Action; 65]) -> [[Action; 13]; 5] {
     ]
 }
 
-const fn convert_layers<const L: usize>(
-    input: [[Action<core::convert::Infallible>; 65]; L],
-) -> Layers<13, 5, L> {
-    let i = 0;
-    let mut new_layers: [[[Action<core::convert::Infallible>; 13]; 5]; L] =
-        [[[Action::NoOp; 13]; 5]; L];
-    while i <= L {
+const fn convert_layers<const L: usize>(input: [[Action; 65]; L]) -> Layers<13, 5, L> {
+    let mut i = 0;
+    let mut new_layers: [[[Action; 13]; 5]; L] = [[[Action::NoOp; 13]; 5]; L];
+    while i < L {
         new_layers[i] = arrange_layer(input[i]);
+        i += 1;
     }
     new_layers
 }
@@ -42,13 +40,20 @@ const fn convert_layers<const L: usize>(
 #[rustfmt::skip]
 #[allow(dead_code)]
 
-pub static ALICE_LAYOUT: Layers<13, 5, 1> = convert_layers(alice_layout! {
+pub static ALICE_LAYOUT: Layers<13, 5, 2> = convert_layers(alice_layout! {
     {
         [Escape '`' 1 2 3 4 5 6 7 8 9 0 - = BSpace]
         [PgUp Tab Q W E R T Y U I O P '[' ']' '\\']
         [PgDown LCtrl A S D F G H J K L ; Quote Enter]
         [LShift Z X C V n B N M , . / RShift n]
         [n LAlt Space LGui Space RAlt RCtrl]
+    }
+    {
+        [ n n n n n n n n n n n n n n n]
+        [ n n n n n n n n n n n n n n n]
+        [ n n n n n n n n n n n n n n]
+        [ n n n n n n n n n n n n n n]
+        [ n n n n n n n]
     }
 });
 

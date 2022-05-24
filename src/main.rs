@@ -26,10 +26,7 @@ mod app {
     use embedded_time::duration::Extensions;
     use usb_device::{class_prelude::*, prelude::*};
 
-    use keyberon::{
-        action::Action, debounce::Debouncer, key_code::KbHidReport, layout::Layers, layout::Layout,
-        matrix::Matrix,
-    };
+    use keyberon::{debounce::Debouncer, key_code::KbHidReport, layout::Layout, matrix::Matrix};
 
     const COL_NUM: usize = 13;
     const ROW_NUM: usize = 5;
@@ -46,7 +43,7 @@ mod app {
         #[lock_free]
         debouncer: Debouncer<[[bool; COL_NUM]; ROW_NUM]>,
         #[lock_free]
-        layout: Layout<COL_NUM, ROW_NUM, 1>,
+        layout: Layout<COL_NUM, ROW_NUM, 2>,
         #[lock_free]
         watchdog: hal::watchdog::Watchdog,
     }
