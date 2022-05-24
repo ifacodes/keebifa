@@ -26,10 +26,13 @@ mod app {
     use embedded_time::duration::Extensions;
     use usb_device::{class_prelude::*, prelude::*};
 
-    use keyberon::{debounce::Debouncer, key_code::KbHidReport, layout::Layout, matrix::Matrix};
+    use keyberon::{
+        action::Action, debounce::Debouncer, key_code::KbHidReport, layout::Layers, layout::Layout,
+        matrix::Matrix,
+    };
 
-    const COL_NUM: usize = 2;
-    const ROW_NUM: usize = 2;
+    const COL_NUM: usize = 13;
+    const ROW_NUM: usize = 5;
 
     #[shared]
     struct Shared {
@@ -112,12 +115,26 @@ mod app {
             cortex_m::interrupt::free(move |_cs| {
                 Matrix::new(
                     [
+                        pins.tx.into_pull_up_input().into(),
+                        pins.rx.into_pull_up_input().into(),
                         pins.d2.into_pull_up_input().into(),
                         pins.d3.into_pull_up_input().into(),
+                        pins.d4.into_pull_up_input().into(),
+                        pins.d5.into_pull_up_input().into(),
+                        pins.d6.into_pull_up_input().into(),
+                        pins.d7.into_pull_up_input().into(),
+                        pins.d8.into_pull_up_input().into(),
+                        pins.d9.into_pull_up_input().into(),
+                        pins.d10.into_pull_up_input().into(),
+                        pins.mosi.into_pull_up_input().into(),
+                        pins.miso.into_pull_up_input().into(),
                     ],
                     [
+                        pins.a3.into_push_pull_output().into(),
                         pins.a2.into_push_pull_output().into(),
                         pins.a1.into_push_pull_output().into(),
+                        pins.a0.into_push_pull_output().into(),
+                        pins.sclk.into_push_pull_output().into(),
                     ],
                 )
             })
@@ -126,7 +143,7 @@ mod app {
         let debouncer =
             Debouncer::new([[false; COL_NUM]; ROW_NUM], [[false; COL_NUM]; ROW_NUM], 30);
 
-        let layout = Layout::new(&TEST_LAYER);
+        let layout = Layout::new(&ALICE_LAYOUT);
 
         // initalisze timer, alarm, and watchdog
 
